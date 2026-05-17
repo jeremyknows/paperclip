@@ -118,42 +118,90 @@ function withParentProofEnvelope(executionState: unknown, parentProofEnvelope: u
   };
 }
 
+export function validateParentDoneProofEnvelope(
+  envelope: unknown,
+  expectedChildren?: Array<{ id: string; identifier?: string | null; status: string }> | number,
+): { ok: true } | { ok: false; reason: string; details?: Record<string, unknown> } {
+  const record = asRecord(envelope);
+  if (!record) return { ok: false, reason: "missing_or_invalid_envelope" };
+  if (record.proof_envelope_version !== "parent_proof_envelope_v0.1") {
+    return {
+      ok: false,
+      reason: "invalid_envelope_version",
+      details: { expected: "parent_proof_envelope_v0.1", actual: record.proof_envelope_version ?? null },
+    };
+  }
+  if (record.verdict !== "PASS") return { ok: false, reason: "verdict_not_pass", details: { actual: record.verdict ?? null } };
+  if (record.parent_closeable !== true) {
+    return { ok: false, reason: "parent_not_closeable", details: { actual: record.parent_closeable ?? null } };
+  }
+  if (typeof record.child_count !== "number" || record.child_count <= 0) {
+    return { ok: false, reason: "invalid_child_count", details: { actual: record.child_count ?? null } };
+  }
+
+  const expectedChildCount = Array.isArray(expectedChildren) ? expectedChildren.length : expectedChildren;
+  if (expectedChildCount !== undefined && record.child_count !== expectedChildCount) {
+    return {
+      ok: false,
+      reason: "child_count_mismatch",
+      details: { expected: expectedChildCount, actual: record.child_count },
+    };
+  }
+
+  const children = Array.isArray(record.children) ? record.children : null;
+  if (!children) return { ok: false, reason: "children_missing_or_invalid" };
+  if (children.length !== record.child_count) {
+    return { ok: false, reason: "children_length_mismatch", details: { expected: record.child_count, actual: children.length } };
+  }
+
+  if (Array.isArray(expectedChildren)) {
+    const terminalChildStatuses = new Set(["done", "cancelled"]);
+    const childProofRefs = new Set(
+      children
+        .map((child) => asRecord(child))
+        .flatMap((child) => [child?.issueId, child?.id, child?.issue_id, child?.child_id, child?.identifier, child?.label])
+        .filter((childRef): childRef is string => typeof childRef === "string"),
+    );
+    const missingChildren = expectedChildren.filter((child) => {
+      const expectedRefs = [child.id, child.identifier].filter((childRef): childRef is string => typeof childRef === "string");
+      return !terminalChildStatuses.has(child.status) || !expectedRefs.some((childRef) => childProofRefs.has(childRef));
+    });
+    if (missingChildren.length > 0) {
+      return {
+        ok: false,
+        reason: "child_proofs_do_not_match_actual_terminal_children",
+        details: {
+          missingChildren: missingChildren.map((child) => ({
+            id: child.id,
+            identifier: child.identifier ?? null,
+            status: child.status,
+          })),
+        },
+      };
+    }
+  }
+
+  const classifications = Array.isArray(record.classifications) ? record.classifications : null;
+  if (!classifications) return { ok: false, reason: "classifications_missing_or_invalid" };
+  if (classifications.length !== 0) {
+    return { ok: false, reason: "classifications_not_empty", details: { classifications } };
+  }
+
+  const synthesis = asRecord(record.parent_synthesis);
+  if (synthesis?.exists !== true) return { ok: false, reason: "parent_synthesis_missing" };
+  const hygiene = asRecord(synthesis.hygiene);
+  if (hygiene?.pass !== true) {
+    return { ok: false, reason: "parent_synthesis_hygiene_failed", details: { hygiene: hygiene ?? null } };
+  }
+
+  return { ok: true };
+}
+
 export function isPassingParentDoneProofEnvelope(
   envelope: unknown,
   expectedChildren?: Array<{ id: string; identifier?: string | null; status: string }> | number,
 ) {
-  const record = asRecord(envelope);
-  if (!record) return false;
-  const classifications = Array.isArray(record.classifications) ? record.classifications : null;
-  const children = Array.isArray(record.children) ? record.children : null;
-  const synthesis = asRecord(record.parent_synthesis);
-  const hygiene = asRecord(synthesis?.hygiene);
-  const expectedChildCount = Array.isArray(expectedChildren) ? expectedChildren.length : expectedChildren;
-  const terminalChildStatuses = new Set(["done", "cancelled"]);
-  const childProofRefs = new Set(
-    (children ?? [])
-      .map((child) => asRecord(child))
-      .flatMap((child) => [child?.issueId, child?.id, child?.issue_id, child?.child_id, child?.identifier, child?.label])
-      .filter((childRef): childRef is string => typeof childRef === "string"),
-  );
-  const childProofsMatchActualChildren = !Array.isArray(expectedChildren)
-    || expectedChildren.every((child) => {
-      const expectedRefs = [child.id, child.identifier].filter((childRef): childRef is string => typeof childRef === "string");
-      return terminalChildStatuses.has(child.status) && expectedRefs.some((childRef) => childProofRefs.has(childRef));
-    });
-  return record.proof_envelope_version === "parent_proof_envelope_v0.1"
-    && record.verdict === "PASS"
-    && record.parent_closeable === true
-    && typeof record.child_count === "number"
-    && record.child_count > 0
-    && (expectedChildCount === undefined || record.child_count === expectedChildCount)
-    && children !== null
-    && children.length === record.child_count
-    && childProofsMatchActualChildren
-    && classifications !== null
-    && classifications.length === 0
-    && synthesis?.exists === true
-    && hygiene?.pass === true;
+  return validateParentDoneProofEnvelope(envelope, expectedChildren).ok;
 }
 
 function assertTransition(from: string, to: string) {
@@ -4387,11 +4435,13 @@ export function issueService(db: Db) {
             const envelope = parentProofEnvelope !== undefined
               ? parentProofEnvelope
               : extractParentDoneProofEnvelope(existing.executionState);
-            if (!isPassingParentDoneProofEnvelope(envelope, childRows)) {
+            const validation = validateParentDoneProofEnvelope(envelope, childRows);
+            if (!validation.ok) {
               throw unprocessable("Parent issue done transition requires a passing parent proof envelope", {
                 gate: "parent_done_proof_envelope",
                 expectedEnvelopeVersion: "parent_proof_envelope_v0.1",
-                reason: "child proof envelopes and parent synthesis must validate before parent closure",
+                reason: validation.reason,
+                ...(validation.details ? { validationDetails: validation.details } : {}),
               });
             }
           }
