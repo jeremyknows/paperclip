@@ -54,6 +54,7 @@ export interface InstanceExperimentalSettings {
   enableCloudSync: boolean;
   autoRestartDevServerWhenIdle: boolean;
   enableIssueGraphLivenessAutoRecovery: boolean;
+  enableParentDoneProofEnvelopeGate: boolean;
   issueGraphLivenessAutoRecoveryLookbackHours: number;
 }
 

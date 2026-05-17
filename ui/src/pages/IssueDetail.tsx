@@ -199,7 +199,14 @@ type ActionableIssueThreadInteraction =
   | SuggestTasksInteraction
   | RequestConfirmationInteraction
   | RequestCheckboxConfirmationInteraction;
-type ResolveRecoveryActionOutcome = "restored" | "false_positive" | "blocked" | "cancelled";
+type ResolveRecoveryActionOutcome =
+  | "restored"
+  | "false_positive"
+  | "blocked"
+  | "held"
+  | "resource_capped"
+  | "operator_paused"
+  | "cancelled";
 type IssueDetailComment = (IssueComment | OptimisticIssueComment) & {
   runId?: string | null;
   runAgentId?: string | null;
