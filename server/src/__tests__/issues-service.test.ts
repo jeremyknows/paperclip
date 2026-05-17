@@ -29,6 +29,7 @@ import {
   deriveIssueCommentRunLogAttribution,
   ISSUE_LIST_MAX_LIMIT,
   isPassingParentDoneProofEnvelope,
+  validateParentDoneProofEnvelope,
   issueService,
 } from "../services/issues.ts";
 import { buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH, updateIssueSchema } from "@paperclipai/shared";
@@ -73,6 +74,26 @@ describe("parent done proof envelope gate helpers", () => {
       ...passingEnvelope,
       parent_synthesis: { exists: true, hygiene: { checked: true, pass: false, findings: [] } },
     })).toBe(false);
+  });
+
+
+  it("explains why a PASS-shaped envelope fails against actual child rows", () => {
+    const childId = randomUUID();
+    const validation = validateParentDoneProofEnvelope(
+      {
+        ...passingEnvelope,
+        children: [{ issueId: randomUUID(), label: "OTHER-1", closeable: true }],
+      },
+      [{ id: childId, identifier: "CHILD-1", status: "done" }],
+    );
+
+    expect(validation).toEqual({
+      ok: false,
+      reason: "child_proofs_do_not_match_actual_terminal_children",
+      details: {
+        missingChildren: [{ id: childId, identifier: "CHILD-1", status: "done" }],
+      },
+    });
   });
 
   it("preserves a proof envelope submitted through the public update schema", () => {
@@ -485,7 +506,13 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     ]);
     await instanceSettingsService(db).updateExperimental({ enableParentDoneProofEnvelopeGate: true });
 
-    await expect(svc.update(parentId, { status: "done" })).rejects.toMatchObject({ status: 422 });
+    await expect(svc.update(parentId, { status: "done" })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({
+        gate: "parent_done_proof_envelope",
+        reason: "missing_or_invalid_envelope",
+      }),
+    });
   });
 
   it("leaves parent done behavior unchanged when the proof-envelope gate is disabled", async () => {
