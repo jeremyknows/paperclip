@@ -1659,7 +1659,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           reason: "no_invokable_recovery_owner",
         },
       monitorPolicy: null,
-      maxAttempts: null,
+      maxAttempts: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON ? 1 : null,
       lastAttemptAt: now,
     });
 
@@ -1673,6 +1673,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause: StrandedRecoveryCause;
   }) {
     if (!input.action.ownerAgentId) return;
+    if (input.action.maxAttempts !== null && input.action.attemptCount > input.action.maxAttempts) {
+      await logger.info({
+        recoveryActionId: input.action.id,
+        sourceIssueId: input.issue.id,
+        attemptCount: input.action.attemptCount,
+        maxAttempts: input.action.maxAttempts,
+      }, "source-scoped recovery wake suppressed after max attempts");
+      return;
+    }
     await deps.enqueueWakeup(input.action.ownerAgentId, {
       source: "assignment",
       triggerDetail: "system",

@@ -130,7 +130,7 @@ export const issuesApi = {
     id: string,
     data: {
       actionId?: string;
-      outcome: "restored" | "false_positive" | "blocked" | "cancelled";
+      outcome: "restored" | "false_positive" | "blocked" | "held" | "resource_capped" | "operator_paused" | "cancelled";
       sourceIssueStatus: "done" | "in_review" | "blocked";
       resolutionNote?: string | null;
     },
