@@ -14,13 +14,13 @@ import type {
   IssueLabel,
   IssueRecoveryAction,
   IssueRetryNowResponse,
+  ResolveIssueRecoveryAction,
   IssueThreadInteraction,
   IssueTreeControlPreview,
   IssueTreeHold,
   IssueWorkProduct,
   PreviewIssueTreeControl,
   ReleaseIssueTreeHold,
-  ResolveIssueRecoveryAction,
   UpsertIssueDocument,
 } from "@paperclipai/shared";
 import { api } from "./client";
@@ -129,12 +129,7 @@ export const issuesApi = {
     api.patch<IssueUpdateResponse>(`/issues/${id}`, data),
   resolveRecoveryAction: (
     id: string,
-    data: {
-      actionId?: string;
-      outcome: ResolveIssueRecoveryAction["outcome"];
-      sourceIssueStatus: ResolveIssueRecoveryAction["sourceIssueStatus"];
-      resolutionNote?: string | null;
-    },
+    data: ResolveIssueRecoveryAction,
   ) => api.post<ResolveRecoveryActionResponse>(`/issues/${id}/recovery-actions/resolve`, data),
   previewTreeControl: (id: string, data: PreviewIssueTreeControl) =>
     api.post<IssueTreeControlPreview>(`/issues/${id}/tree-control/preview`, data),
