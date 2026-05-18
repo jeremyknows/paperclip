@@ -20,6 +20,7 @@ import type {
   IssueWorkProduct,
   PreviewIssueTreeControl,
   ReleaseIssueTreeHold,
+  ResolveIssueRecoveryAction,
   UpsertIssueDocument,
 } from "@paperclipai/shared";
 import { api } from "./client";
@@ -130,8 +131,8 @@ export const issuesApi = {
     id: string,
     data: {
       actionId?: string;
-      outcome: "restored" | "false_positive" | "blocked" | "cancelled";
-      sourceIssueStatus: "todo" | "done" | "in_review" | "blocked";
+      outcome: ResolveIssueRecoveryAction["outcome"];
+      sourceIssueStatus: ResolveIssueRecoveryAction["sourceIssueStatus"];
       resolutionNote?: string | null;
     },
   ) => api.post<ResolveRecoveryActionResponse>(`/issues/${id}/recovery-actions/resolve`, data),
