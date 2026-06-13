@@ -8,6 +8,7 @@ describe("network bind helpers", () => {
   afterEach(() => {
     process.env = { ...ORIGINAL_ENV };
   });
+
   it("rejects non-loopback bind modes in local_trusted", () => {
     expect(
       validateConfiguredBindMode({
