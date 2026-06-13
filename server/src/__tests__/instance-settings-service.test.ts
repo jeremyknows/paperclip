@@ -24,6 +24,7 @@ describe("instance settings service", () => {
       autoRestartDevServerWhenIdle: true,
       enableIssueGraphLivenessAutoRecovery: true,
       issueGraphLivenessAutoRecoveryLookbackHours: 48,
+      enableParentDoneProofEnvelopeGate: false,
     });
   });
 
