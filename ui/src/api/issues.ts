@@ -136,10 +136,8 @@ export const issuesApi = {
     api.post<Issue>(`/companies/${companyId}/issues`, data),
   update: (id: string, data: Record<string, unknown>) =>
     api.patch<IssueUpdateResponse>(`/issues/${id}`, data),
-  resolveRecoveryAction: (
-    id: string,
-    data: ResolveIssueRecoveryAction,
-  ) => api.post<ResolveRecoveryActionResponse>(`/issues/${id}/recovery-actions/resolve`, data),
+  resolveRecoveryAction: (id: string, data: ResolveIssueRecoveryAction) =>
+    api.post<ResolveRecoveryActionResponse>(`/issues/${id}/recovery-actions/resolve`, data),
   previewTreeControl: (id: string, data: PreviewIssueTreeControl) =>
     api.post<IssueTreeControlPreview>(`/issues/${id}/tree-control/preview`, data),
   createTreeHold: (id: string, data: CreateIssueTreeHold) =>

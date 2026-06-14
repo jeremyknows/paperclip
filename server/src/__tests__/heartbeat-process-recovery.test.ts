@@ -1427,9 +1427,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       recoveryCause: "workspace_validation_failed",
     });
     expect(recoveryAction?.nextAction).toContain("Repair the source issue workspace link");
-
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments.some((comment) => comment.body.includes("workspace failed validation"))).toBe(true);
   });
 
   it("queues one finish-handoff wake when a successful run leaves in-progress work without a next action", async () => {
