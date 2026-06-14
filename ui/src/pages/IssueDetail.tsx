@@ -170,6 +170,7 @@ import {
   type IssueThreadInteraction,
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
+  type ResolveIssueRecoveryAction,
   type SuggestTasksInteraction,
   type IssueTreeControlMode,
   type WorkspaceFileRef,
@@ -199,14 +200,7 @@ type ActionableIssueThreadInteraction =
   | SuggestTasksInteraction
   | RequestConfirmationInteraction
   | RequestCheckboxConfirmationInteraction;
-type ResolveRecoveryActionOutcome =
-  | "restored"
-  | "false_positive"
-  | "blocked"
-  | "held"
-  | "resource_capped"
-  | "operator_paused"
-  | "cancelled";
+type ResolveRecoveryActionOutcome = ResolveIssueRecoveryAction["outcome"];
 type IssueDetailComment = (IssueComment | OptimisticIssueComment) & {
   runId?: string | null;
   runAgentId?: string | null;
