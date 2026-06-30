@@ -139,6 +139,19 @@ import {
 } from "../services/trust-preset-resolver.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+
+function routeRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function extractParentDoneProofEnvelopeForRoute(executionState: unknown): Record<string, unknown> | null {
+  const state = routeRecord(executionState);
+  if (!state) return null;
+  return routeRecord(state.parentProofEnvelope)
+    ?? routeRecord(state.parentClosureProofEnvelope)
+    ?? routeRecord(state.parent_proof_envelope_v0_1);
+}
+
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -5102,6 +5115,13 @@ export function issueRoutes(
     }
 
     let issue;
+    const preproducedParentDoneAdversarialVerification =
+      transition.decision && decisionId && updateFields.status === "done"
+        ? await svc.produceParentDoneAdversarialVerification(
+          id,
+          updateFields.parentProofEnvelope ?? extractParentDoneProofEnvelopeForRoute(existing.executionState),
+        )
+        : undefined;
     try {
       if (transition.decision && decisionId) {
         const decision = transition.decision;
@@ -5112,6 +5132,7 @@ export function issueRoutes(
               ...updateFields,
               actorAgentId: actor.agentId ?? null,
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              preproducedParentDoneAdversarialVerification,
             },
             tx,
           );
@@ -6831,6 +6852,12 @@ export function issueRoutes(
         metadata: req.body.metadata ?? null,
         sourceTrust,
       };
+      const preproducedAutoApprovalVerification = updatePatch.status === "done"
+        ? await svc.produceParentDoneAdversarialVerification(
+          id,
+          extractParentDoneProofEnvelopeForRoute(currentIssue.executionState),
+        )
+        : undefined;
       let txResult: { comment: Awaited<ReturnType<typeof svc.addComment>>; issue: NonNullable<Awaited<ReturnType<typeof svc.update>>> };
       try {
         txResult = await db.transaction(async (tx) => {
@@ -6845,7 +6872,10 @@ export function issueRoutes(
             commentOptions,
             tx,
           );
-          const updated = await svc.update(id, updatePatch, tx);
+          const updated = await svc.update(id, {
+            ...updatePatch,
+            preproducedParentDoneAdversarialVerification: preproducedAutoApprovalVerification,
+          }, tx);
           // Throw (not return null) so drizzle rolls back the inserted comment when the issue
           // has been concurrently deleted between the initial fetch and the in-transaction update.
           if (!updated) throw new AutoApprovalIssueMissingError();
