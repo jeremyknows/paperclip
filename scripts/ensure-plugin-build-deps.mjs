@@ -15,13 +15,16 @@ const lockPollMs = 100;
 const buildTargets = [
   {
     name: "@paperclipai/shared",
-    output: path.join(rootDir, "packages/shared/dist/index.js"),
+    outputs: [path.join(rootDir, "packages/shared/dist/index.js")],
     sourceDir: path.join(rootDir, "packages/shared/src"),
     tsconfig: path.join(rootDir, "packages/shared/tsconfig.json"),
   },
   {
     name: "@paperclipai/plugin-sdk",
-    output: path.join(rootDir, "packages/plugins/sdk/dist/index.js"),
+    outputs: [
+      path.join(rootDir, "packages/plugins/sdk/dist/index.js"),
+      path.join(rootDir, "packages/plugins/sdk/dist/dev-cli.js"),
+    ],
     sourceDir: path.join(rootDir, "packages/plugins/sdk/src"),
     tsconfig: path.join(rootDir, "packages/plugins/sdk/tsconfig.json"),
   },
@@ -51,9 +54,9 @@ function newestSourceMtimeMs(sourceDir) {
 }
 
 function needsBuild(target) {
-  if (!fs.existsSync(target.output)) return true;
-  const outputMtime = fs.statSync(target.output).mtimeMs;
-  return newestSourceMtimeMs(target.sourceDir) > outputMtime;
+  if (target.outputs.some((output) => !fs.existsSync(output))) return true;
+  const oldestOutputMtime = Math.min(...target.outputs.map((output) => fs.statSync(output).mtimeMs));
+  return newestSourceMtimeMs(target.sourceDir) > oldestOutputMtime;
 }
 
 function allOutputsCurrent() {

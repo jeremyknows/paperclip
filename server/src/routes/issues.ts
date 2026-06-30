@@ -5115,16 +5115,16 @@ export function issueRoutes(
     }
 
     let issue;
+    const routeRequiresAdversarialProof =
+      (updateFields.requireAdversarialProof ?? existing.requireAdversarialProof) === true;
     const experimentalSettingsForPreproduce = updateFields.status === "done"
+      && routeRequiresAdversarialProof
       ? await instanceSettings.getExperimental()
       : null;
     const shouldPreproduceParentDoneAdversarialVerification =
       updateFields.status === "done"
       && experimentalSettingsForPreproduce?.enableParentDoneProofEnvelopeGate === true
-      && (
-        experimentalSettingsForPreproduce.enableAdversarialProofVerification
-        || (updateFields.requireAdversarialProof ?? existing.requireAdversarialProof) === true
-      );
+      && routeRequiresAdversarialProof;
     const preproducedParentDoneAdversarialVerification =
       transition.decision && decisionId && shouldPreproduceParentDoneAdversarialVerification
         ? await svc.produceParentDoneAdversarialVerification(
@@ -6862,16 +6862,15 @@ export function issueRoutes(
         metadata: req.body.metadata ?? null,
         sourceTrust,
       };
+      const autoApprovalRequiresAdversarialProof = currentIssue.requireAdversarialProof === true;
       const experimentalSettingsForAutoApprovalPreproduce = updatePatch.status === "done"
+        && autoApprovalRequiresAdversarialProof
         ? await instanceSettings.getExperimental()
         : null;
       const shouldPreproduceAutoApprovalVerification =
         updatePatch.status === "done"
         && experimentalSettingsForAutoApprovalPreproduce?.enableParentDoneProofEnvelopeGate === true
-        && (
-          experimentalSettingsForAutoApprovalPreproduce.enableAdversarialProofVerification
-          || currentIssue.requireAdversarialProof === true
-        );
+        && autoApprovalRequiresAdversarialProof;
       const preproducedAutoApprovalVerification = shouldPreproduceAutoApprovalVerification
         ? await svc.produceParentDoneAdversarialVerification(
           id,
