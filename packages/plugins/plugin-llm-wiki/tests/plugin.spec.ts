@@ -586,6 +586,7 @@ function paperclipIssue(overrides: Partial<Issue> = {}): Issue {
     originFingerprint: null,
     requestDepth: 0,
     billingCode: null,
+    requireAdversarialProof: false,
     assigneeAdapterOverrides: null,
     executionPolicy: null,
     executionState: null,

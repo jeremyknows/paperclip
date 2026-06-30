@@ -1552,6 +1552,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           originRunId: input.originRunId ?? null,
           requestDepth: input.requestDepth ?? 0,
           billingCode: input.billingCode ?? null,
+          requireAdversarialProof: false,
           assigneeAdapterOverrides: input.assigneeAdapterOverrides ?? null,
           executionWorkspaceId: input.executionWorkspaceId ?? null,
           executionWorkspacePreference: input.executionWorkspacePreference ?? null,
