@@ -25,6 +25,7 @@ describe("instance settings service", () => {
       enableIssueGraphLivenessAutoRecovery: true,
       issueGraphLivenessAutoRecoveryLookbackHours: 48,
       enableParentDoneProofEnvelopeGate: false,
+      enableAdversarialProofVerification: false,
     });
   });
 

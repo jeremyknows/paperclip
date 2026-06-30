@@ -76,6 +76,12 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { getServerAdapter } from "../adapters/index.js";
+import {
+  buildAdversarialProofVerifierPrompt,
+  parseAdversarialProofVerifierResponse,
+  type AdversarialProofVerificationBlock,
+} from "./adversarial-proof-verifier.js";
 import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -130,17 +136,296 @@ function withParentProofEnvelope(executionState: unknown, parentProofEnvelope: u
   };
 }
 
+type ParentDoneProofEnvelopeValidationFailure = {
+  ok: false;
+  reason: string;
+  details?: Record<string, unknown>;
+};
+
+type ParentDoneProofEnvelopeValidationResult = { ok: true } | ParentDoneProofEnvelopeValidationFailure;
+
+type ParentDoneAdversarialVerificationResult =
+  | { ok: true; envelope: Record<string, unknown>; verification: AdversarialProofVerificationBlock }
+  | ParentDoneProofEnvelopeValidationFailure;
+
+const DEFAULT_ADVERSARIAL_PROOF_VERIFIER_TIMEOUT_MS = 120_000;
+const DEFAULT_ADVERSARIAL_PROOF_VERIFIER_TOKEN_CAP = 12_000;
+const ADVERSARIAL_PROOF_VERIFIER_CONFIG_TIMEOUT_KEY = "adversarialProofVerifierTimeoutMs";
+const ADVERSARIAL_PROOF_VERIFIER_CONFIG_TOKEN_CAP_KEY = "adversarialProofVerifierTokenCap";
+
+type ParentCloseChildRow = { id: string; identifier: string | null; status: string };
+
+function responseTextFromVerifierResult(result: Awaited<ReturnType<ReturnType<typeof getServerAdapter>["execute"]>>) {
+  const resultJson = asRecord(result.resultJson);
+  const stdout = typeof resultJson?.stdout === "string" ? resultJson.stdout.trim() : "";
+  if (stdout) return stdout;
+  if (typeof result.summary === "string" && result.summary.trim().length > 0) return result.summary.trim();
+  if (resultJson) return JSON.stringify(resultJson);
+  return "";
+}
+
+function readPositiveNumber(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function verifierTokenUsage(result: Awaited<ReturnType<ReturnType<typeof getServerAdapter>["execute"]>>, verification?: AdversarialProofVerificationBlock | null) {
+  return verification?.cost_tokens
+    ?? (((result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0)) || null);
+}
+
+async function withVerifierTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | { timedOut: true }> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<{ timedOut: true }>((resolve) => {
+        timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function isReviewerCapableAgent(agent: typeof agents.$inferSelect) {
+  const haystack = [agent.capabilities, agent.role, agent.title, agent.name]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ")
+    .toLowerCase();
+  return /\b(review|reviewer|verifier|proof|qa|quality)\b/.test(haystack);
+}
+
+async function listDescendantIssueRowsForVerifierIndependence(
+  dbOrTx: any,
+  companyId: string,
+  parentIssueId: string,
+): Promise<Array<{ id: string; identifier: string | null; status: string; assigneeAgentId: string | null }>> {
+  const rows: Array<{ id: string; identifier: string | null; status: string; assigneeAgentId: string | null }> = [];
+  let frontier = [parentIssueId];
+  const seen = new Set<string>(frontier);
+  for (let depth = 0; frontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH; depth += 1) {
+    const nextFrontier: string[] = [];
+    for (const chunk of chunkList(frontier, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+      const childRows: Array<{ id: string; identifier: string | null; status: string; assigneeAgentId: string | null }> = await dbOrTx
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), inArray(issues.parentId, chunk)));
+      for (const child of childRows) {
+        if (seen.has(child.id)) continue;
+        seen.add(child.id);
+        rows.push(child);
+        nextFrontier.push(child.id);
+      }
+    }
+    frontier = nextFrontier;
+  }
+  return rows;
+}
+
+async function selectAdversarialProofVerifier(
+  dbOrTx: any,
+  input: { parent: typeof issues.$inferSelect; executorAgentId: string },
+) {
+  const descendantRows = await listDescendantIssueRowsForVerifierIndependence(dbOrTx, input.parent.companyId, input.parent.id);
+  const excludedAgentIds = new Set<string>([
+    input.executorAgentId,
+    ...descendantRows
+      .map((row) => row.assigneeAgentId)
+      .filter((agentId): agentId is string => typeof agentId === "string" && agentId.trim().length > 0),
+  ]);
+
+  const candidateRows: Array<typeof agents.$inferSelect> = await dbOrTx
+    .select()
+    .from(agents)
+    .where(and(
+      eq(agents.companyId, input.parent.companyId),
+      eq(agents.status, "active"),
+    ))
+    .orderBy(asc(agents.createdAt), asc(agents.id));
+
+  return candidateRows
+    .filter((candidate) => !excludedAgentIds.has(candidate.id))
+    .sort((a, b) => {
+      const reviewerDelta = Number(isReviewerCapableAgent(b)) - Number(isReviewerCapableAgent(a));
+      if (reviewerDelta !== 0) return reviewerDelta;
+      const createdDelta = new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+      if (createdDelta !== 0) return createdDelta;
+      return a.id.localeCompare(b.id);
+    })[0] ?? null;
+}
+
+function childRowsFingerprint(childRows: ParentCloseChildRow[]) {
+  return JSON.stringify(
+    childRows
+      .map((child) => ({ id: child.id, identifier: child.identifier ?? null, status: child.status }))
+      .sort((a, b) => a.id.localeCompare(b.id)),
+  );
+}
+
+async function loadParentCloseStateForProofGate(dbOrTx: any, parentIssueId: string) {
+  const parent = await dbOrTx
+    .select()
+    .from(issues)
+    .where(eq(issues.id, parentIssueId))
+    .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
+  if (!parent) return null;
+  const childRows: ParentCloseChildRow[] = await dbOrTx
+    .select({ id: issues.id, identifier: issues.identifier, status: issues.status })
+    .from(issues)
+    .where(and(eq(issues.companyId, parent.companyId), eq(issues.parentId, parent.id)));
+  return { parent, childRows };
+}
+
+async function produceAdversarialVerificationForParentClose(
+  dbOrTx: any,
+  input: {
+    parent: typeof issues.$inferSelect;
+    childRows: ParentCloseChildRow[];
+    proofEnvelope: unknown;
+  },
+): Promise<ParentDoneAdversarialVerificationResult> {
+  const envelope = asRecord(input.proofEnvelope);
+  if (!envelope) return { ok: false, reason: "missing_or_invalid_envelope" };
+
+  const executorAgentId = typeof input.parent.assigneeAgentId === "string" && input.parent.assigneeAgentId.trim().length > 0
+    ? input.parent.assigneeAgentId.trim()
+    : null;
+  if (!executorAgentId) return { ok: false, reason: "verification_executor_agent_missing" };
+
+  const verifier = await selectAdversarialProofVerifier(dbOrTx, { parent: input.parent, executorAgentId });
+
+  if (!verifier) return { ok: false, reason: "verification_verifier_agent_missing" };
+
+  const verifierConfig = asRecord(verifier.adapterConfig) ?? {};
+  const timeoutMs = readPositiveNumber(verifierConfig[ADVERSARIAL_PROOF_VERIFIER_CONFIG_TIMEOUT_KEY], DEFAULT_ADVERSARIAL_PROOF_VERIFIER_TIMEOUT_MS);
+  const tokenCap = readPositiveNumber(verifierConfig[ADVERSARIAL_PROOF_VERIFIER_CONFIG_TOKEN_CAP_KEY], DEFAULT_ADVERSARIAL_PROOF_VERIFIER_TOKEN_CAP);
+
+  const prompt = buildAdversarialProofVerifierPrompt({
+    parentIssue: {
+      id: input.parent.id,
+      identifier: input.parent.identifier,
+      title: input.parent.title,
+    },
+    executorAgentId,
+    verifierAgentId: verifier.id,
+    proofEnvelope: envelope,
+    childArtifacts: input.childRows.map((child) => ({
+      issueId: child.id,
+      identifier: child.identifier,
+      status: child.status,
+      artifact: asRecord(envelope)?.children ?? null,
+    })),
+  });
+
+  const run = await dbOrTx
+    .insert(heartbeatRuns)
+    .values({
+      companyId: input.parent.companyId,
+      agentId: verifier.id,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: {
+        source: "parent_done_adversarial_verification",
+        parentIssueId: input.parent.id,
+        executorAgentId,
+        verifierAgentId: verifier.id,
+        timeoutMs,
+        tokenCap,
+      },
+      issueCommentStatus: "not_applicable",
+      startedAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .returning()
+    .then((rows: Array<typeof heartbeatRuns.$inferSelect>) => rows[0]);
+
+  const adapter = getServerAdapter(verifier.adapterType);
+  try {
+    const adapterPromise = adapter.execute({
+      runId: run.id,
+      agent: verifier,
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: `parent-close-verifier:${input.parent.id}` },
+      config: verifierConfig,
+      context: {
+        source: "parent_done_adversarial_verification",
+        parentIssueId: input.parent.id,
+        executorAgentId,
+        verifierAgentId: verifier.id,
+        prompt,
+        tokenCap,
+      },
+      runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(verifierConfig) ?? null,
+      executionTarget: null,
+      onLog: async () => {},
+      onMeta: async () => {},
+    });
+    const result = await withVerifierTimeout(adapterPromise, timeoutMs);
+    if ("timedOut" in result && result.timedOut === true) {
+      await dbOrTx.update(heartbeatRuns).set({ status: "timed_out", error: `adversarial proof verifier exceeded ${timeoutMs}ms timeout`, finishedAt: new Date(), updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+      return { ok: false, reason: "verification_failed", details: { verifier_agent_id: verifier.id, runId: run.id, timeoutMs } };
+    }
+
+    if (result.timedOut || (result.exitCode ?? 0) !== 0 || result.errorMessage) {
+      await dbOrTx.update(heartbeatRuns).set({ status: result.timedOut ? "timed_out" : "failed", error: result.errorMessage ?? null, finishedAt: new Date(), updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+      return { ok: false, reason: "verification_failed", details: { verifier_agent_id: verifier.id, runId: run.id } };
+    }
+
+    let verification: AdversarialProofVerificationBlock;
+    try {
+      verification = parseAdversarialProofVerifierResponse(responseTextFromVerifierResult(result));
+    } catch (err) {
+      await dbOrTx.update(heartbeatRuns).set({ status: "failed", error: err instanceof Error ? err.message : String(err), finishedAt: new Date(), updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+      return { ok: false, reason: "verification_failed", details: { verifier_agent_id: verifier.id, runId: run.id } };
+    }
+
+    const costTokens = verifierTokenUsage(result, verification);
+    if (costTokens !== null && costTokens > tokenCap) {
+      await dbOrTx.update(heartbeatRuns).set({ status: "failed", error: `adversarial proof verifier token cap exceeded: ${costTokens} > ${tokenCap}`, finishedAt: new Date(), updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+      return { ok: false, reason: "verification_failed", details: { verifier_agent_id: verifier.id, runId: run.id, tokenCap, costTokens } };
+    }
+
+    const serverAttestedVerification = {
+      ...verification,
+      verifier_agent_id: verifier.id,
+      model: verification.model ?? result.model ?? null,
+      cost_tokens: costTokens,
+    };
+    const verifiedEnvelope = {
+      ...envelope,
+      executor_agent_id: executorAgentId,
+      verification: serverAttestedVerification,
+    };
+
+    await dbOrTx.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    return { ok: true, envelope: verifiedEnvelope, verification: serverAttestedVerification };
+  } catch (err) {
+    await dbOrTx.update(heartbeatRuns).set({ status: "failed", error: err instanceof Error ? err.message : String(err), finishedAt: new Date(), updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    return { ok: false, reason: "verification_failed", details: { verifier_agent_id: verifier.id, runId: run.id } };
+  }
+}
+
 export function validateParentDoneProofEnvelope(
   envelope: unknown,
   expectedChildren?: Array<{ id: string; identifier?: string | null; status: string }> | number,
-): { ok: true } | { ok: false; reason: string; details?: Record<string, unknown> } {
+  options: { requireAdversarialVerification?: boolean; executorAgentId?: string | null } = {},
+): ParentDoneProofEnvelopeValidationResult {
   const record = asRecord(envelope);
   if (!record) return { ok: false, reason: "missing_or_invalid_envelope" };
-  if (record.proof_envelope_version !== "parent_proof_envelope_v0.1") {
+  const proofEnvelopeVersion = record.proof_envelope_version;
+  const allowedVersions = options.requireAdversarialVerification
+    ? ["parent_proof_envelope_v0.2"]
+    : ["parent_proof_envelope_v0.1", "parent_proof_envelope_v0.2"];
+  if (typeof proofEnvelopeVersion !== "string" || !allowedVersions.includes(proofEnvelopeVersion)) {
     return {
       ok: false,
       reason: "invalid_envelope_version",
-      details: { expected: "parent_proof_envelope_v0.1", actual: record.proof_envelope_version ?? null },
+      details: { expected: allowedVersions.join("|"), actual: record.proof_envelope_version ?? null },
     };
   }
   if (record.verdict !== "PASS") return { ok: false, reason: "verdict_not_pass", details: { actual: record.verdict ?? null } };
@@ -206,14 +491,62 @@ export function validateParentDoneProofEnvelope(
     return { ok: false, reason: "parent_synthesis_hygiene_failed", details: { hygiene: hygiene ?? null } };
   }
 
+  if (options.requireAdversarialVerification) {
+    const verification = asRecord(record.verification);
+    if (!verification) return { ok: false, reason: "verification_missing_or_invalid" };
+    if (verification.verdict !== "survived") {
+      return { ok: false, reason: "verification_verdict_not_survived", details: { actual: verification.verdict ?? null } };
+    }
+    const verifierAgentId = typeof verification.verifier_agent_id === "string" && verification.verifier_agent_id.trim().length > 0
+      ? verification.verifier_agent_id.trim()
+      : null;
+    if (!verifierAgentId) return { ok: false, reason: "verification_verifier_agent_missing" };
+    const executorAgentId = options.requireAdversarialVerification
+      ? (typeof options.executorAgentId === "string" ? options.executorAgentId : null)
+      : options.executorAgentId
+        ?? (typeof record.executor_agent_id === "string" ? record.executor_agent_id : null)
+        ?? (typeof record.executorAgentId === "string" ? record.executorAgentId : null)
+        ?? (typeof record.doer_agent_id === "string" ? record.doer_agent_id : null)
+        ?? (typeof record.doerAgentId === "string" ? record.doerAgentId : null);
+    if (!executorAgentId || executorAgentId.trim().length === 0) {
+      return { ok: false, reason: "verification_executor_agent_missing" };
+    }
+    if (verifierAgentId === executorAgentId.trim()) {
+      return {
+        ok: false,
+        reason: "verification_not_independent",
+        details: { verifier_agent_id: verifierAgentId, executor_agent_id: executorAgentId.trim() },
+      };
+    }
+    const attempts = Array.isArray(verification.attempts) ? verification.attempts : null;
+    if (!attempts || attempts.length === 0) return { ok: false, reason: "verification_attempts_missing_or_invalid" };
+    for (const [index, attemptValue] of attempts.entries()) {
+      const attempt = asRecord(attemptValue);
+      if (!attempt) return { ok: false, reason: "verification_attempt_invalid", details: { index } };
+      if (typeof attempt.claim_ref !== "string" || attempt.claim_ref.trim().length === 0) {
+        return { ok: false, reason: "verification_attempt_claim_ref_missing", details: { index } };
+      }
+      if (typeof attempt.refutation_tried !== "string" || attempt.refutation_tried.trim().length === 0) {
+        return { ok: false, reason: "verification_attempt_refutation_missing", details: { index } };
+      }
+      if (attempt.outcome !== "survived") {
+        return { ok: false, reason: "verification_attempt_not_survived", details: { index, outcome: attempt.outcome ?? null } };
+      }
+      if (attempt.evidence === undefined || attempt.evidence === null) {
+        return { ok: false, reason: "verification_attempt_evidence_missing", details: { index } };
+      }
+    }
+  }
+
   return { ok: true };
 }
 
 export function isPassingParentDoneProofEnvelope(
   envelope: unknown,
   expectedChildren?: Array<{ id: string; identifier?: string | null; status: string }> | number,
+  options: { requireAdversarialVerification?: boolean; executorAgentId?: string | null } = {},
 ) {
-  return validateParentDoneProofEnvelope(envelope, expectedChildren).ok;
+  return validateParentDoneProofEnvelope(envelope, expectedChildren, options).ok;
 }
 
 function assertTransition(from: string, to: string) {
@@ -5278,26 +5611,59 @@ export function issueService(db: Db) {
           throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
         }
       }
+      let parentCloseProofPrecheck: {
+        parentStatus: string;
+        parentAssigneeAgentId: string | null;
+        childFingerprint: string;
+      } | null = null;
       if (patch.status === "done") {
         const experimentalSettings = await instanceSettings.getExperimental();
         if (experimentalSettings.enableParentDoneProofEnvelopeGate) {
-          const childRows = await dbOrTx
-            .select({ id: issues.id, identifier: issues.identifier, status: issues.status })
-            .from(issues)
-            .where(and(eq(issues.companyId, existing.companyId), eq(issues.parentId, existing.id)));
-          if (childRows.length > 0) {
-            const envelope = parentProofEnvelope !== undefined
+          const closeState = await loadParentCloseStateForProofGate(dbOrTx, existing.id);
+          const childRows = closeState?.childRows ?? [];
+          if (closeState && childRows.length > 0) {
+            const submittedEnvelope = parentProofEnvelope !== undefined
               ? parentProofEnvelope
               : extractParentDoneProofEnvelope(existing.executionState);
-            const validation = validateParentDoneProofEnvelope(envelope, childRows);
+            let envelope = submittedEnvelope;
+            let adversarialFailure: ParentDoneProofEnvelopeValidationFailure | null = null;
+            if (experimentalSettings.enableAdversarialProofVerification) {
+              // Run the verifier before the final parent-close transaction. The
+              // transaction below re-reads this state and fails closed if the
+              // parent/children changed while the verifier was running.
+              const produced = await produceAdversarialVerificationForParentClose(dbOrTx === db ? db : dbOrTx, {
+                parent: closeState.parent,
+                childRows,
+                proofEnvelope: submittedEnvelope,
+              });
+              if (produced.ok) {
+                envelope = produced.envelope;
+                patch.executionState = withParentProofEnvelope(patch.executionState ?? existing.executionState, produced.envelope);
+              } else {
+                adversarialFailure = produced;
+              }
+            }
+            const validation = adversarialFailure ?? validateParentDoneProofEnvelope(envelope, childRows, {
+              requireAdversarialVerification: experimentalSettings.enableAdversarialProofVerification,
+              executorAgentId: closeState.parent.assigneeAgentId,
+            });
             if (!validation.ok) {
               throw unprocessable("Parent issue done transition requires a passing parent proof envelope", {
-                gate: "parent_done_proof_envelope",
-                expectedEnvelopeVersion: "parent_proof_envelope_v0.1",
+                gate: experimentalSettings.enableAdversarialProofVerification
+                  ? "adversarial_parent_done_proof_verification"
+                  : "parent_done_proof_envelope",
+                expectedEnvelopeVersion: experimentalSettings.enableAdversarialProofVerification
+                  ? "parent_proof_envelope_v0.2"
+                  : "parent_proof_envelope_v0.1|parent_proof_envelope_v0.2",
                 reason: validation.reason,
                 ...(validation.details ? { validationDetails: validation.details } : {}),
               });
             }
+            parentCloseProofPrecheck = {
+              parentStatus: closeState.parent.status,
+              parentAssigneeAgentId: closeState.parent.assigneeAgentId,
+              childFingerprint: childRowsFingerprint(childRows),
+            };
           }
         }
       }
@@ -5372,6 +5738,21 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (parentCloseProofPrecheck) {
+          const currentCloseState = await loadParentCloseStateForProofGate(tx, existing.id);
+          const currentChildFingerprint = currentCloseState ? childRowsFingerprint(currentCloseState.childRows) : null;
+          if (
+            !currentCloseState
+            || currentCloseState.parent.status !== parentCloseProofPrecheck.parentStatus
+            || currentCloseState.parent.assigneeAgentId !== parentCloseProofPrecheck.parentAssigneeAgentId
+            || currentChildFingerprint !== parentCloseProofPrecheck.childFingerprint
+          ) {
+            throw unprocessable("Parent issue done transition proof became stale before commit", {
+              gate: "adversarial_parent_done_proof_verification",
+              reason: "verification_toctou_state_changed",
+            });
+          }
+        }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
           getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),

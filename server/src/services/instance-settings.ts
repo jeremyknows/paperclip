@@ -53,6 +53,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       autoRestartDevServerWhenIdle: parsed.data.autoRestartDevServerWhenIdle ?? false,
       enableIssueGraphLivenessAutoRecovery: parsed.data.enableIssueGraphLivenessAutoRecovery ?? false,
       enableParentDoneProofEnvelopeGate: parsed.data.enableParentDoneProofEnvelopeGate ?? false,
+      enableAdversarialProofVerification: parsed.data.enableAdversarialProofVerification ?? false,
       issueGraphLivenessAutoRecoveryLookbackHours:
         parsed.data.issueGraphLivenessAutoRecoveryLookbackHours ??
         DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -69,6 +70,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     autoRestartDevServerWhenIdle: false,
     enableIssueGraphLivenessAutoRecovery: false,
     enableParentDoneProofEnvelopeGate: false,
+    enableAdversarialProofVerification: false,
     issueGraphLivenessAutoRecoveryLookbackHours:
       DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   };
