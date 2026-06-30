@@ -5115,8 +5115,18 @@ export function issueRoutes(
     }
 
     let issue;
+    const experimentalSettingsForPreproduce = updateFields.status === "done"
+      ? await instanceSettings.getExperimental()
+      : null;
+    const shouldPreproduceParentDoneAdversarialVerification =
+      updateFields.status === "done"
+      && experimentalSettingsForPreproduce?.enableParentDoneProofEnvelopeGate === true
+      && (
+        experimentalSettingsForPreproduce.enableAdversarialProofVerification
+        || (updateFields.requireAdversarialProof ?? existing.requireAdversarialProof) === true
+      );
     const preproducedParentDoneAdversarialVerification =
-      transition.decision && decisionId && updateFields.status === "done"
+      transition.decision && decisionId && shouldPreproduceParentDoneAdversarialVerification
         ? await svc.produceParentDoneAdversarialVerification(
           id,
           updateFields.parentProofEnvelope ?? extractParentDoneProofEnvelopeForRoute(existing.executionState),
@@ -6852,7 +6862,17 @@ export function issueRoutes(
         metadata: req.body.metadata ?? null,
         sourceTrust,
       };
-      const preproducedAutoApprovalVerification = updatePatch.status === "done"
+      const experimentalSettingsForAutoApprovalPreproduce = updatePatch.status === "done"
+        ? await instanceSettings.getExperimental()
+        : null;
+      const shouldPreproduceAutoApprovalVerification =
+        updatePatch.status === "done"
+        && experimentalSettingsForAutoApprovalPreproduce?.enableParentDoneProofEnvelopeGate === true
+        && (
+          experimentalSettingsForAutoApprovalPreproduce.enableAdversarialProofVerification
+          || currentIssue.requireAdversarialProof === true
+        );
+      const preproducedAutoApprovalVerification = shouldPreproduceAutoApprovalVerification
         ? await svc.produceParentDoneAdversarialVerification(
           id,
           extractParentDoneProofEnvelopeForRoute(currentIssue.executionState),

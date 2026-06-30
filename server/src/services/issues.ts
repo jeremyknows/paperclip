@@ -2457,6 +2457,7 @@ const issueListSelect = {
   originFingerprint: issues.originFingerprint,
   requestDepth: issues.requestDepth,
   billingCode: issues.billingCode,
+  requireAdversarialProof: issues.requireAdversarialProof,
   assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
   executionPolicy: sql<null>`null`,
   executionState: sql<null>`null`,
@@ -5702,7 +5703,10 @@ export function issueService(db: Db) {
               : extractParentDoneProofEnvelope(existing.executionState);
             let envelope = submittedEnvelope;
             let adversarialFailure: ParentDoneProofEnvelopeValidationFailure | null = null;
-            if (experimentalSettings.enableAdversarialProofVerification) {
+            const shouldRequireAdversarialProof =
+              experimentalSettings.enableAdversarialProofVerification
+              || (issueData.requireAdversarialProof ?? existing.requireAdversarialProof) === true;
+            if (shouldRequireAdversarialProof) {
               if (dbOrTx !== db && !preproducedParentDoneAdversarialVerification) {
                 adversarialFailure = { ok: false, reason: "verification_requires_preproduced_outside_transaction" };
               } else {
@@ -5721,15 +5725,15 @@ export function issueService(db: Db) {
               }
             }
             const validation = adversarialFailure ?? validateParentDoneProofEnvelope(envelope, childRows, {
-              requireAdversarialVerification: experimentalSettings.enableAdversarialProofVerification,
+              requireAdversarialVerification: shouldRequireAdversarialProof,
               executorAgentId: closeState.parent.assigneeAgentId,
             });
             if (!validation.ok) {
               throw unprocessable("Parent issue done transition requires a passing parent proof envelope", {
-                gate: experimentalSettings.enableAdversarialProofVerification
+                gate: shouldRequireAdversarialProof
                   ? "adversarial_parent_done_proof_verification"
                   : "parent_done_proof_envelope",
-                expectedEnvelopeVersion: experimentalSettings.enableAdversarialProofVerification
+                expectedEnvelopeVersion: shouldRequireAdversarialProof
                   ? "parent_proof_envelope_v0.2"
                   : "parent_proof_envelope_v0.1|parent_proof_envelope_v0.2",
                 reason: validation.reason,

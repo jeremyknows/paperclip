@@ -196,12 +196,14 @@ describe("parent done proof envelope gate helpers", () => {
     });
   });
 
-  it("preserves a proof envelope submitted through the public update schema", () => {
+  it("preserves proof opt-in fields submitted through the public update schema", () => {
     const parsed = updateIssueSchema.parse({
       status: "done",
+      requireAdversarialProof: true,
       parentProofEnvelope: passingEnvelope,
     });
 
+    expect(parsed.requireAdversarialProof).toBe(true);
     expect(parsed.parentProofEnvelope).toEqual(passingEnvelope);
     expect("executionState" in parsed).toBe(false);
   });
@@ -1241,6 +1243,150 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
 
     expect(updated?.status).toBe("done");
+  });
+
+  it("does not spawn an adversarial verifier for non-opt-in issues when the global flag is off", async () => {
+    const companyId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    const executorAgentId = randomUUID();
+    const verifierAgentId = randomUUID();
+    const adapterType = `adversarial_test_${randomUUID()}`;
+    const calls: AdapterExecutionContext[] = [];
+    registerServerAdapter({
+      type: adapterType,
+      execute: async (ctx) => {
+        calls.push(ctx);
+        return { exitCode: 0, signal: null, timedOut: false, resultJson: { stdout: "{}" } };
+      },
+      testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: "2026-06-30T04:00:00.000Z" }),
+      models: [],
+    });
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values([
+        agentRow(companyId, { id: executorAgentId, name: "Executor" }),
+        agentRow(companyId, { id: verifierAgentId, name: "Verifier", adapterType }),
+      ]);
+      await db.insert(issues).values([
+        { id: parentId, companyId, title: "Parent", status: "todo", priority: "medium", assigneeAgentId: executorAgentId },
+        { id: childId, companyId, parentId, title: "Child", status: "done", priority: "medium" },
+      ]);
+      await instanceSettingsService(db).updateExperimental({
+        enableParentDoneProofEnvelopeGate: true,
+        enableAdversarialProofVerification: false,
+      });
+
+      const updated = await svc.update(parentId, {
+        status: "done",
+        parentProofEnvelope: {
+          proof_envelope_version: "parent_proof_envelope_v0.1",
+          verdict: "PASS",
+          parent_closeable: true,
+          child_count: 1,
+          children: [{ issueId: childId, label: "CHILD-1", closeable: true, artifact_sha256: "abc123" }],
+          classifications: [],
+          parent_synthesis: { exists: true, hygiene: { checked: true, pass: true, findings: [] } },
+        },
+      });
+
+      expect(updated?.status).toBe("done");
+      expect(calls).toHaveLength(0);
+    } finally {
+      unregisterServerAdapter(adapterType);
+    }
+  });
+
+  it("server-spawns an adversarial verifier for opted-in issues when the global flag is off", async () => {
+    const companyId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    const executorAgentId = randomUUID();
+    const verifierAgentId = randomUUID();
+    const adapterType = `adversarial_test_${randomUUID()}`;
+    const calls: AdapterExecutionContext[] = [];
+    registerServerAdapter({
+      type: adapterType,
+      execute: async (ctx) => {
+        calls.push(ctx);
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          model: "fake-verifier",
+          usage: { inputTokens: 7, outputTokens: 11 },
+          resultJson: { stdout: JSON.stringify({
+            verifier_agent_id: verifierAgentId,
+            attempts: [{
+              claim_ref: "CHILD-1",
+              refutation_tried: "checked child terminal status and synthesis evidence",
+              outcome: "survived",
+              evidence: "child row is terminal and synthesis is hygienic",
+            }],
+            verdict: "survived",
+            verified_at: "2026-06-30T04:00:00.000Z",
+            model: "fake-verifier",
+            cost_tokens: 18,
+          }) },
+        };
+      },
+      testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: "2026-06-30T04:00:00.000Z" }),
+      models: [],
+    });
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values([
+        agentRow(companyId, { id: executorAgentId, name: "Executor" }),
+        agentRow(companyId, { id: verifierAgentId, name: "Verifier", adapterType }),
+      ]);
+      await db.insert(issues).values([
+        { id: parentId, companyId, title: "Parent", status: "todo", priority: "medium", assigneeAgentId: executorAgentId, requireAdversarialProof: true },
+        { id: childId, companyId, parentId, title: "Child", status: "done", priority: "medium" },
+      ]);
+      await instanceSettingsService(db).updateExperimental({
+        enableParentDoneProofEnvelopeGate: true,
+        enableAdversarialProofVerification: false,
+      });
+
+      const updated = await svc.update(parentId, {
+        status: "done",
+        parentProofEnvelope: {
+          proof_envelope_version: "parent_proof_envelope_v0.2",
+          verdict: "PASS",
+          parent_closeable: true,
+          child_count: 1,
+          children: [{ issueId: childId, label: "CHILD-1", closeable: true, artifact_sha256: "abc123" }],
+          classifications: [],
+          parent_synthesis: { exists: true, hygiene: { checked: true, pass: true, findings: [] } },
+        },
+      });
+
+      expect(updated?.status).toBe("done");
+      expect(calls).toHaveLength(1);
+      const persisted = await db
+        .select({ executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, parentId))
+        .then((rows) => rows[0]);
+      expect((persisted?.executionState as Record<string, any>)?.parentProofEnvelope?.verification).toMatchObject({
+        verifier_agent_id: verifierAgentId,
+        verdict: "survived",
+      });
+    } finally {
+      unregisterServerAdapter(adapterType);
+    }
   });
 
   it("blocks parent done when adversarial verification is enabled without a v0.2 survived verifier block", async () => {
