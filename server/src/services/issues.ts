@@ -76,7 +76,7 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
-import { getServerAdapter } from "../adapters/index.js";
+import { getServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
 import {
   buildAdversarialProofVerifierPrompt,
   parseAdversarialProofVerifierResponse,
@@ -153,7 +153,15 @@ const DEFAULT_ADVERSARIAL_PROOF_VERIFIER_TOKEN_CAP = 12_000;
 const ADVERSARIAL_PROOF_VERIFIER_CONFIG_TIMEOUT_KEY = "adversarialProofVerifierTimeoutMs";
 const ADVERSARIAL_PROOF_VERIFIER_CONFIG_TOKEN_CAP_KEY = "adversarialProofVerifierTokenCap";
 
-type ParentCloseChildRow = { id: string; identifier: string | null; status: string };
+type ParentCloseChildRow = {
+  id: string;
+  identifier: string | null;
+  title?: string | null;
+  status: string;
+  executionState?: unknown;
+  executionRunId?: string | null;
+  completedAt?: Date | string | null;
+};
 
 function responseTextFromVerifierResult(result: Awaited<ReturnType<ReturnType<typeof getServerAdapter>["execute"]>>) {
   const resultJson = asRecord(result.resultJson);
@@ -169,17 +177,20 @@ function readPositiveNumber(value: unknown, fallback: number) {
 }
 
 function verifierTokenUsage(result: Awaited<ReturnType<ReturnType<typeof getServerAdapter>["execute"]>>, verification?: AdversarialProofVerificationBlock | null) {
-  return verification?.cost_tokens
-    ?? (((result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0)) || null);
+  const measuredUsage = (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0);
+  return measuredUsage > 0 ? measuredUsage : (verification?.cost_tokens ?? null);
 }
 
-async function withVerifierTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | { timedOut: true }> {
+async function withVerifierTimeout<T>(promise: Promise<T>, timeoutMs: number, controller: AbortController): Promise<T | { timedOut: true }> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   try {
     return await Promise.race([
       promise,
       new Promise<{ timedOut: true }>((resolve) => {
-        timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+        timer = setTimeout(() => {
+          controller.abort();
+          resolve({ timedOut: true });
+        }, timeoutMs);
       }),
     ]);
   } finally {
@@ -199,11 +210,12 @@ async function listDescendantIssueRowsForVerifierIndependence(
   dbOrTx: any,
   companyId: string,
   parentIssueId: string,
-): Promise<Array<{ id: string; identifier: string | null; status: string; assigneeAgentId: string | null }>> {
+): Promise<{ rows: Array<{ id: string; identifier: string | null; status: string; assigneeAgentId: string | null }>; truncated: boolean }> {
   const rows: Array<{ id: string; identifier: string | null; status: string; assigneeAgentId: string | null }> = [];
   let frontier = [parentIssueId];
   const seen = new Set<string>(frontier);
-  for (let depth = 0; frontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH; depth += 1) {
+  let truncated = false;
+  while (frontier.length > 0) {
     const nextFrontier: string[] = [];
     for (const chunk of chunkList(frontier, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
       const childRows: Array<{ id: string; identifier: string | null; status: string; assigneeAgentId: string | null }> = await dbOrTx
@@ -220,21 +232,26 @@ async function listDescendantIssueRowsForVerifierIndependence(
         seen.add(child.id);
         rows.push(child);
         nextFrontier.push(child.id);
+        if (seen.size > BLOCKER_ATTENTION_MAX_NODES) {
+          truncated = true;
+          return { rows, truncated };
+        }
       }
     }
     frontier = nextFrontier;
   }
-  return rows;
+  return { rows, truncated };
 }
 
 async function selectAdversarialProofVerifier(
   dbOrTx: any,
   input: { parent: typeof issues.$inferSelect; executorAgentId: string },
 ) {
-  const descendantRows = await listDescendantIssueRowsForVerifierIndependence(dbOrTx, input.parent.companyId, input.parent.id);
+  const descendants = await listDescendantIssueRowsForVerifierIndependence(dbOrTx, input.parent.companyId, input.parent.id);
+  if (descendants.truncated) return { verifier: null, truncated: true };
   const excludedAgentIds = new Set<string>([
     input.executorAgentId,
-    ...descendantRows
+    ...descendants.rows
       .map((row) => row.assigneeAgentId)
       .filter((agentId): agentId is string => typeof agentId === "string" && agentId.trim().length > 0),
   ]);
@@ -248,7 +265,7 @@ async function selectAdversarialProofVerifier(
     ))
     .orderBy(asc(agents.createdAt), asc(agents.id));
 
-  return candidateRows
+  const verifier = candidateRows
     .filter((candidate) => !excludedAgentIds.has(candidate.id))
     .sort((a, b) => {
       const reviewerDelta = Number(isReviewerCapableAgent(b)) - Number(isReviewerCapableAgent(a));
@@ -257,6 +274,7 @@ async function selectAdversarialProofVerifier(
       if (createdDelta !== 0) return createdDelta;
       return a.id.localeCompare(b.id);
     })[0] ?? null;
+  return { verifier, truncated: false };
 }
 
 function childRowsFingerprint(childRows: ParentCloseChildRow[]) {
@@ -275,10 +293,43 @@ async function loadParentCloseStateForProofGate(dbOrTx: any, parentIssueId: stri
     .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
   if (!parent) return null;
   const childRows: ParentCloseChildRow[] = await dbOrTx
-    .select({ id: issues.id, identifier: issues.identifier, status: issues.status })
+    .select({
+      id: issues.id,
+      identifier: issues.identifier,
+      title: issues.title,
+      status: issues.status,
+      executionState: issues.executionState,
+      executionRunId: issues.executionRunId,
+      completedAt: issues.completedAt,
+    })
     .from(issues)
     .where(and(eq(issues.companyId, parent.companyId), eq(issues.parentId, parent.id)));
   return { parent, childRows };
+}
+
+function buildServerFetchedChildArtifact(child: ParentCloseChildRow) {
+  return {
+    source: "server_fetched_child_work_product",
+    issueId: child.id,
+    identifier: child.identifier,
+    title: child.title ?? null,
+    status: child.status,
+    executionRunId: child.executionRunId ?? null,
+    completedAt: child.completedAt ?? null,
+    executionState: child.executionState ?? null,
+  };
+}
+
+function proofEnvelopeForVerifier(envelope: Record<string, unknown>, childRows: ParentCloseChildRow[]) {
+  return {
+    ...envelope,
+    children: childRows.map((child) => ({
+      issueId: child.id,
+      identifier: child.identifier,
+      status: child.status,
+    })),
+    child_artifact_source: "server_fetched_child_work_product",
+  };
 }
 
 async function produceAdversarialVerificationForParentClose(
@@ -297,7 +348,9 @@ async function produceAdversarialVerificationForParentClose(
     : null;
   if (!executorAgentId) return { ok: false, reason: "verification_executor_agent_missing" };
 
-  const verifier = await selectAdversarialProofVerifier(dbOrTx, { parent: input.parent, executorAgentId });
+  const verifierSelection = await selectAdversarialProofVerifier(dbOrTx, { parent: input.parent, executorAgentId });
+  if (verifierSelection.truncated) return { ok: false, reason: "verification_descendant_tree_truncated" };
+  const verifier = verifierSelection.verifier as typeof agents.$inferSelect;
 
   if (!verifier) return { ok: false, reason: "verification_verifier_agent_missing" };
 
@@ -313,12 +366,13 @@ async function produceAdversarialVerificationForParentClose(
     },
     executorAgentId,
     verifierAgentId: verifier.id,
-    proofEnvelope: envelope,
+    proofEnvelope: proofEnvelopeForVerifier(envelope, input.childRows),
     childArtifacts: input.childRows.map((child) => ({
       issueId: child.id,
       identifier: child.identifier,
+      title: child.title ?? null,
       status: child.status,
-      artifact: asRecord(envelope)?.children ?? null,
+      artifact: buildServerFetchedChildArtifact(child),
     })),
   });
 
@@ -346,6 +400,7 @@ async function produceAdversarialVerificationForParentClose(
     .then((rows: Array<typeof heartbeatRuns.$inferSelect>) => rows[0]);
 
   const adapter = getServerAdapter(verifier.adapterType);
+  const controller = new AbortController();
   try {
     const adapterPromise = adapter.execute({
       runId: run.id,
@@ -362,10 +417,11 @@ async function produceAdversarialVerificationForParentClose(
       },
       runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(verifierConfig) ?? null,
       executionTarget: null,
+      abortSignal: controller.signal,
       onLog: async () => {},
       onMeta: async () => {},
-    });
-    const result = await withVerifierTimeout(adapterPromise, timeoutMs);
+    } as AdapterExecutionContext & { abortSignal: AbortSignal });
+    const result = await withVerifierTimeout(adapterPromise, timeoutMs, controller);
     if ("timedOut" in result && result.timedOut === true) {
       await dbOrTx.update(heartbeatRuns).set({ status: "timed_out", error: `adversarial proof verifier exceeded ${timeoutMs}ms timeout`, finishedAt: new Date(), updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
       return { ok: false, reason: "verification_failed", details: { verifier_agent_id: verifier.id, runId: run.id, timeoutMs } };
@@ -534,6 +590,13 @@ export function validateParentDoneProofEnvelope(
       }
       if (attempt.evidence === undefined || attempt.evidence === null) {
         return { ok: false, reason: "verification_attempt_evidence_missing", details: { index } };
+      }
+      if (
+        (typeof attempt.evidence === "string" && attempt.evidence.trim().length === 0)
+        || attempt.evidence === false
+        || attempt.evidence === 0
+      ) {
+        return { ok: false, reason: "verification_attempt_evidence_empty", details: { index } };
       }
     }
   }
@@ -5542,6 +5605,16 @@ export function issueService(db: Db) {
       });
     },
 
+    produceParentDoneAdversarialVerification: async (id: string, parentProofEnvelope: unknown) => {
+      const closeState = await loadParentCloseStateForProofGate(db, id);
+      if (!closeState) return { ok: false, reason: "missing_or_invalid_envelope" } as ParentDoneAdversarialVerificationResult;
+      return produceAdversarialVerificationForParentClose(db, {
+        parent: closeState.parent,
+        childRows: closeState.childRows,
+        proofEnvelope: parentProofEnvelope,
+      });
+    },
+
     update: async (
       id: string,
       data: Partial<typeof issues.$inferInsert> & {
@@ -5550,6 +5623,7 @@ export function issueService(db: Db) {
         actorAgentId?: string | null;
         actorUserId?: string | null;
         parentProofEnvelope?: unknown;
+        preproducedParentDoneAdversarialVerification?: ParentDoneAdversarialVerificationResult;
       },
       dbOrTx: any = db,
     ) => {
@@ -5566,6 +5640,7 @@ export function issueService(db: Db) {
         actorAgentId,
         actorUserId,
         parentProofEnvelope,
+        preproducedParentDoneAdversarialVerification,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -5628,19 +5703,21 @@ export function issueService(db: Db) {
             let envelope = submittedEnvelope;
             let adversarialFailure: ParentDoneProofEnvelopeValidationFailure | null = null;
             if (experimentalSettings.enableAdversarialProofVerification) {
-              // Run the verifier before the final parent-close transaction. The
-              // transaction below re-reads this state and fails closed if the
-              // parent/children changed while the verifier was running.
-              const produced = await produceAdversarialVerificationForParentClose(dbOrTx === db ? db : dbOrTx, {
-                parent: closeState.parent,
-                childRows,
-                proofEnvelope: submittedEnvelope,
-              });
-              if (produced.ok) {
-                envelope = produced.envelope;
-                patch.executionState = withParentProofEnvelope(patch.executionState ?? existing.executionState, produced.envelope);
+              if (dbOrTx !== db && !preproducedParentDoneAdversarialVerification) {
+                adversarialFailure = { ok: false, reason: "verification_requires_preproduced_outside_transaction" };
               } else {
-                adversarialFailure = produced;
+                const produced = preproducedParentDoneAdversarialVerification
+                  ?? await produceAdversarialVerificationForParentClose(db, {
+                    parent: closeState.parent,
+                    childRows,
+                    proofEnvelope: submittedEnvelope,
+                  });
+                if (produced.ok) {
+                  envelope = produced.envelope;
+                  patch.executionState = withParentProofEnvelope(patch.executionState ?? existing.executionState, produced.envelope);
+                } else {
+                  adversarialFailure = produced;
+                }
               }
             }
             const validation = adversarialFailure ?? validateParentDoneProofEnvelope(envelope, childRows, {
@@ -5862,7 +5939,9 @@ export function issueService(db: Db) {
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(eq(issues.id, id))
+          .where(parentCloseProofPrecheck
+            ? and(eq(issues.id, id), eq(issues.status, parentCloseProofPrecheck.parentStatus))
+            : eq(issues.id, id))
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;

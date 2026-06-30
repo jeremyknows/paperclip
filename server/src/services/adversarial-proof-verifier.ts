@@ -107,6 +107,13 @@ export function parseAdversarialProofVerifierResponse(responseText: string): Adv
     if (attempt.evidence === undefined || attempt.evidence === null) {
       throw new Error(`adversarial verifier attempt ${index} missing evidence`);
     }
+    if (
+      (typeof attempt.evidence === "string" && attempt.evidence.trim().length === 0)
+      || attempt.evidence === false
+      || attempt.evidence === 0
+    ) {
+      throw new Error(`adversarial verifier attempt ${index} evidence must be non-empty`);
+    }
     return {
       claim_ref: claimRef,
       refutation_tried: refutationTried,
