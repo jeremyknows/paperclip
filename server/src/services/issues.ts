@@ -133,14 +133,19 @@ function withParentProofEnvelope(executionState: unknown, parentProofEnvelope: u
 export function validateParentDoneProofEnvelope(
   envelope: unknown,
   expectedChildren?: Array<{ id: string; identifier?: string | null; status: string }> | number,
+  options: { requireAdversarialVerification?: boolean; executorAgentId?: string | null } = {},
 ): { ok: true } | { ok: false; reason: string; details?: Record<string, unknown> } {
   const record = asRecord(envelope);
   if (!record) return { ok: false, reason: "missing_or_invalid_envelope" };
-  if (record.proof_envelope_version !== "parent_proof_envelope_v0.1") {
+  const proofEnvelopeVersion = record.proof_envelope_version;
+  const allowedVersions = options.requireAdversarialVerification
+    ? ["parent_proof_envelope_v0.2"]
+    : ["parent_proof_envelope_v0.1", "parent_proof_envelope_v0.2"];
+  if (typeof proofEnvelopeVersion !== "string" || !allowedVersions.includes(proofEnvelopeVersion)) {
     return {
       ok: false,
       reason: "invalid_envelope_version",
-      details: { expected: "parent_proof_envelope_v0.1", actual: record.proof_envelope_version ?? null },
+      details: { expected: allowedVersions.join("|"), actual: record.proof_envelope_version ?? null },
     };
   }
   if (record.verdict !== "PASS") return { ok: false, reason: "verdict_not_pass", details: { actual: record.verdict ?? null } };
@@ -206,14 +211,60 @@ export function validateParentDoneProofEnvelope(
     return { ok: false, reason: "parent_synthesis_hygiene_failed", details: { hygiene: hygiene ?? null } };
   }
 
+  if (options.requireAdversarialVerification) {
+    const verification = asRecord(record.verification);
+    if (!verification) return { ok: false, reason: "verification_missing_or_invalid" };
+    if (verification.verdict !== "survived") {
+      return { ok: false, reason: "verification_verdict_not_survived", details: { actual: verification.verdict ?? null } };
+    }
+    const verifierAgentId = typeof verification.verifier_agent_id === "string" && verification.verifier_agent_id.trim().length > 0
+      ? verification.verifier_agent_id.trim()
+      : null;
+    if (!verifierAgentId) return { ok: false, reason: "verification_verifier_agent_missing" };
+    const executorAgentId = options.executorAgentId
+      ?? (typeof record.executor_agent_id === "string" ? record.executor_agent_id : null)
+      ?? (typeof record.executorAgentId === "string" ? record.executorAgentId : null)
+      ?? (typeof record.doer_agent_id === "string" ? record.doer_agent_id : null)
+      ?? (typeof record.doerAgentId === "string" ? record.doerAgentId : null);
+    if (!executorAgentId || executorAgentId.trim().length === 0) {
+      return { ok: false, reason: "verification_executor_agent_missing" };
+    }
+    if (verifierAgentId === executorAgentId.trim()) {
+      return {
+        ok: false,
+        reason: "verification_not_independent",
+        details: { verifier_agent_id: verifierAgentId, executor_agent_id: executorAgentId.trim() },
+      };
+    }
+    const attempts = Array.isArray(verification.attempts) ? verification.attempts : null;
+    if (!attempts || attempts.length === 0) return { ok: false, reason: "verification_attempts_missing_or_invalid" };
+    for (const [index, attemptValue] of attempts.entries()) {
+      const attempt = asRecord(attemptValue);
+      if (!attempt) return { ok: false, reason: "verification_attempt_invalid", details: { index } };
+      if (typeof attempt.claim_ref !== "string" || attempt.claim_ref.trim().length === 0) {
+        return { ok: false, reason: "verification_attempt_claim_ref_missing", details: { index } };
+      }
+      if (typeof attempt.refutation_tried !== "string" || attempt.refutation_tried.trim().length === 0) {
+        return { ok: false, reason: "verification_attempt_refutation_missing", details: { index } };
+      }
+      if (attempt.outcome !== "survived") {
+        return { ok: false, reason: "verification_attempt_not_survived", details: { index, outcome: attempt.outcome ?? null } };
+      }
+      if (attempt.evidence === undefined || attempt.evidence === null) {
+        return { ok: false, reason: "verification_attempt_evidence_missing", details: { index } };
+      }
+    }
+  }
+
   return { ok: true };
 }
 
 export function isPassingParentDoneProofEnvelope(
   envelope: unknown,
   expectedChildren?: Array<{ id: string; identifier?: string | null; status: string }> | number,
+  options: { requireAdversarialVerification?: boolean; executorAgentId?: string | null } = {},
 ) {
-  return validateParentDoneProofEnvelope(envelope, expectedChildren).ok;
+  return validateParentDoneProofEnvelope(envelope, expectedChildren, options).ok;
 }
 
 function assertTransition(from: string, to: string) {
@@ -5289,11 +5340,18 @@ export function issueService(db: Db) {
             const envelope = parentProofEnvelope !== undefined
               ? parentProofEnvelope
               : extractParentDoneProofEnvelope(existing.executionState);
-            const validation = validateParentDoneProofEnvelope(envelope, childRows);
+            const validation = validateParentDoneProofEnvelope(envelope, childRows, {
+              requireAdversarialVerification: experimentalSettings.enableAdversarialProofVerification,
+              executorAgentId: existing.assigneeAgentId,
+            });
             if (!validation.ok) {
               throw unprocessable("Parent issue done transition requires a passing parent proof envelope", {
-                gate: "parent_done_proof_envelope",
-                expectedEnvelopeVersion: "parent_proof_envelope_v0.1",
+                gate: experimentalSettings.enableAdversarialProofVerification
+                  ? "adversarial_parent_done_proof_verification"
+                  : "parent_done_proof_envelope",
+                expectedEnvelopeVersion: experimentalSettings.enableAdversarialProofVerification
+                  ? "parent_proof_envelope_v0.2"
+                  : "parent_proof_envelope_v0.1|parent_proof_envelope_v0.2",
                 reason: validation.reason,
                 ...(validation.details ? { validationDetails: validation.details } : {}),
               });

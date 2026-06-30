@@ -38,6 +38,10 @@ import {
   validateParentDoneProofEnvelope,
   issueService,
 } from "../services/issues.ts";
+import {
+  buildAdversarialProofVerifierPrompt,
+  parseAdversarialProofVerifierResponse,
+} from "../services/adversarial-proof-verifier.ts";
 import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH, updateIssueSchema } from "@paperclipai/shared";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -77,6 +81,78 @@ describe("parent done proof envelope gate helpers", () => {
 
   it("accepts the existing parent proof-envelope validator PASS contract", () => {
     expect(isPassingParentDoneProofEnvelope(passingEnvelope)).toBe(true);
+  });
+
+  it("accepts v0.2 only when adversarial verification survived and is independent", () => {
+    const v02Envelope = {
+      ...passingEnvelope,
+      proof_envelope_version: "parent_proof_envelope_v0.2",
+      executor_agent_id: "executor-agent",
+      verification: {
+        verifier_agent_id: "reviewer-agent",
+        attempts: [
+          {
+            claim_ref: "CHILD-1",
+            refutation_tried: "checked the child artifact hash and final receipt against the synthesis",
+            outcome: "survived",
+            evidence: "artifact hash and receipt matched",
+          },
+        ],
+        verdict: "survived",
+        verified_at: "2026-06-30T04:00:00.000Z",
+        model: "test-model",
+        cost_tokens: 12,
+      },
+    };
+
+    expect(isPassingParentDoneProofEnvelope(v02Envelope, undefined, {
+      requireAdversarialVerification: true,
+      executorAgentId: "executor-agent",
+    })).toBe(true);
+    expect(validateParentDoneProofEnvelope({
+      ...v02Envelope,
+      verification: { ...v02Envelope.verification, verdict: "refuted" },
+    }, undefined, { requireAdversarialVerification: true, executorAgentId: "executor-agent" })).toMatchObject({
+      ok: false,
+      reason: "verification_verdict_not_survived",
+    });
+    expect(validateParentDoneProofEnvelope({
+      ...v02Envelope,
+      verification: { ...v02Envelope.verification, verifier_agent_id: "executor-agent" },
+    }, undefined, { requireAdversarialVerification: true, executorAgentId: "executor-agent" })).toMatchObject({
+      ok: false,
+      reason: "verification_not_independent",
+    });
+  });
+
+  it("builds and parses the pure adversarial verifier adapter contract", () => {
+    const prompt = buildAdversarialProofVerifierPrompt({
+      parentIssue: { id: "parent-1", identifier: "PARENT-1", title: "Close parent" },
+      executorAgentId: "executor-agent",
+      verifierAgentId: "reviewer-agent",
+      proofEnvelope: passingEnvelope,
+      childArtifacts: [{ issueId: "child-1", identifier: "CHILD-1", status: "done", artifact: { sha256: "abc" } }],
+    });
+    expect(prompt).toContain("REFUTE each PASS claim");
+    expect(prompt).toContain("reviewer-agent");
+
+    expect(parseAdversarialProofVerifierResponse(JSON.stringify({
+      verifier_agent_id: "reviewer-agent",
+      attempts: [{
+        claim_ref: "CHILD-1",
+        refutation_tried: "looked for stale or missing child evidence",
+        outcome: "survived",
+        evidence: "child evidence present",
+      }],
+      verdict: "survived",
+      verified_at: "2026-06-30T04:00:00.000Z",
+      model: "test-model",
+      cost_tokens: 20,
+    }))).toMatchObject({
+      verifier_agent_id: "reviewer-agent",
+      verdict: "survived",
+      attempts: [{ outcome: "survived" }],
+    });
   });
 
   it("fails closed for missing child proof or non-passing synthesis", () => {
@@ -1145,6 +1221,100 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const updated = await svc.update(parentId, {
       status: "done",
       parentProofEnvelope,
+    });
+
+    expect(updated?.status).toBe("done");
+  });
+
+  it("blocks parent done when adversarial verification is enabled without a v0.2 survived verifier block", async () => {
+    const companyId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    const executorAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values(agentRow(companyId, { id: executorAgentId, name: "Executor" }));
+    await db.insert(issues).values([
+      { id: parentId, companyId, title: "Parent", status: "todo", priority: "medium", assigneeAgentId: executorAgentId },
+      { id: childId, companyId, parentId, title: "Child", status: "done", priority: "medium" },
+    ]);
+    await instanceSettingsService(db).updateExperimental({
+      enableParentDoneProofEnvelopeGate: true,
+      enableAdversarialProofVerification: true,
+    });
+
+    await expect(svc.update(parentId, {
+      status: "done",
+      parentProofEnvelope: {
+        proof_envelope_version: "parent_proof_envelope_v0.1",
+        verdict: "PASS",
+        parent_closeable: true,
+        child_count: 1,
+        children: [{ issueId: childId, closeable: true }],
+        classifications: [],
+        parent_synthesis: { exists: true, hygiene: { checked: true, pass: true, findings: [] } },
+      },
+    })).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({
+        gate: "adversarial_parent_done_proof_verification",
+        reason: "invalid_envelope_version",
+      }),
+    });
+  });
+
+  it("allows parent done when adversarial verification survives with an independent verifier", async () => {
+    const companyId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    const executorAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values(agentRow(companyId, { id: executorAgentId, name: "Executor" }));
+    await db.insert(issues).values([
+      { id: parentId, companyId, title: "Parent", status: "todo", priority: "medium", assigneeAgentId: executorAgentId },
+      { id: childId, companyId, parentId, title: "Child", status: "done", priority: "medium" },
+    ]);
+    await instanceSettingsService(db).updateExperimental({
+      enableParentDoneProofEnvelopeGate: true,
+      enableAdversarialProofVerification: true,
+    });
+
+    const updated = await svc.update(parentId, {
+      status: "done",
+      parentProofEnvelope: {
+        proof_envelope_version: "parent_proof_envelope_v0.2",
+        executor_agent_id: executorAgentId,
+        verdict: "PASS",
+        parent_closeable: true,
+        child_count: 1,
+        children: [{ issueId: childId, closeable: true, artifact_sha256: "abc123" }],
+        classifications: [],
+        parent_synthesis: { exists: true, hygiene: { checked: true, pass: true, findings: [] } },
+        verification: {
+          verifier_agent_id: randomUUID(),
+          attempts: [{
+            claim_ref: "CHILD-1",
+            refutation_tried: "checked for missing child artifact and stale synthesis evidence",
+            outcome: "survived",
+            evidence: "child artifact and synthesis were present",
+          }],
+          verdict: "survived",
+          verified_at: "2026-06-30T04:00:00.000Z",
+          model: "test-model",
+          cost_tokens: 15,
+        },
+      },
     });
 
     expect(updated?.status).toBe("done");

@@ -49,6 +49,7 @@ export const instanceExperimentalSettingsSchema = z.object({
   autoRestartDevServerWhenIdle: z.boolean().default(false),
   enableIssueGraphLivenessAutoRecovery: z.boolean().default(false),
   enableParentDoneProofEnvelopeGate: z.boolean().default(false),
+  enableAdversarialProofVerification: z.boolean().default(false),
   issueGraphLivenessAutoRecoveryLookbackHours: z
     .number()
     .int()

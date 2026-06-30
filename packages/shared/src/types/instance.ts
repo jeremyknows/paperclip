@@ -55,6 +55,7 @@ export interface InstanceExperimentalSettings {
   autoRestartDevServerWhenIdle: boolean;
   enableIssueGraphLivenessAutoRecovery: boolean;
   enableParentDoneProofEnvelopeGate: boolean;
+  enableAdversarialProofVerification: boolean;
   issueGraphLivenessAutoRecoveryLookbackHours: number;
 }
 
